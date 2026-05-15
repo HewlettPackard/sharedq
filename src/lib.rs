@@ -72,9 +72,11 @@ pub extern "C" fn create_queue(
 /// * `size` - Size of the data in bytes.
 ///
 /// # Returns
-/// Number of bytes written, or 0 if the queue is full or on error.
+/// - Positive: number of bytes written (success).
+/// - 0: queue is full or element exceeds max size.
+/// - -32 (EPIPE): notification peer disconnected — caller should reconnect.
 #[no_mangle]
-pub extern "C" fn push(q: &mut Queue, val: *const c_uchar, size: c_uint) -> u32 {
+pub extern "C" fn push(q: &mut Queue, val: *const c_uchar, size: c_uint) -> i32 {
     let slice = unsafe { slice::from_raw_parts(val, size as usize) };
     q.queue.push_non_blocking(slice)
 }

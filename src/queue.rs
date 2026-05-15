@@ -36,6 +36,10 @@ const TAIL_OFFSET: usize = 8;
 const ELEM_OFFSET: usize = 12;
 const SOCKET_NAME: &str = "notifsocket";
 
+/// Returned when the notification socket peer has disconnected (BrokenPipe).
+/// Matches the POSIX EPIPE errno value so C callers can check `ret == -EPIPE`.
+pub const SHAREDQ_EPIPE: i32 = -32;
+
 pub struct Queue {
     mem: MemManager,
     max_elems: usize,
@@ -83,7 +87,13 @@ impl Queue {
         })
     }
 
-    pub fn push_non_blocking(&mut self, val: &[u8]) -> u32 {
+    /// Push a value onto the queue without blocking.
+    ///
+    /// Returns:
+    /// - Positive value: number of bytes written (success)
+    /// - 0: queue is full or element exceeds max size
+    /// - SHAREDQ_EPIPE (-32): notification peer disconnected (BrokenPipe)
+    pub fn push_non_blocking(&mut self, val: &[u8]) -> i32 {
         if val.len() > self.max_elem_size {
             println!("Unable to save element because is bigger than max element size configured!");
             return 0;
@@ -115,9 +125,12 @@ impl Queue {
         // write the head counter
         self.mem.meta_write_u32(HEAD_OFFSET, next_head);
 
-        self.notify(next_head);
+        let notify_rc = self.notify(next_head);
+        if notify_rc < 0 {
+            return notify_rc;
+        }
 
-        val.len() as u32
+        val.len() as i32
     }
 
     pub fn is_empty(&mut self) -> bool {
@@ -206,25 +219,40 @@ impl Queue {
         return -1;
     }
 
-    fn notify(&mut self, val: u32) {
+    /// Notify the peer of a new value via the Unix socket.
+    ///
+    /// Returns 0 on success, SHAREDQ_EPIPE (-32) if the peer disconnected.
+    fn notify(&mut self, val: u32) -> i32 {
         // If the socket stream is already initialized then use it
         if let Some(stream) = &mut self.unix_stream {
             if let Some(listener) = &self.unix_listener {
                 reject_new_connections(listener);
             }
-            send_message(stream, val)
+            match send_message(stream, val) {
+                Ok(_) => 0,
+                Err(ref e)
+                    if e.kind() == ErrorKind::BrokenPipe
+                        || e.kind() == ErrorKind::ConnectionReset
+                        || e.kind() == ErrorKind::NotConnected =>
+                {
+                    // Peer disconnected — drop stale stream so the next
+                    // notify() can accept a fresh connection via listener.
+                    self.unix_stream = None;
+                    SHAREDQ_EPIPE
+                }
+                Err(_) => SHAREDQ_EPIPE,
+            }
         } else {
             // If the listener is already initialized then used it
             if let Some(listener) = &self.unix_listener {
-                //self.unix_stream = Some(accept_connection(listener));
                 match accept_connection(listener) {
                     Some(stream) => {
                         self.unix_stream = Some(stream);
                         reject_new_connections(&listener);
 
-                        self.notify(val);
+                        self.notify(val)
                     }
-                    None => {} // can't notify because the other end is not connected
+                    None => 0, // can't notify because the other end is not connected
                 }
             } else {
                 panic!("at least the listener must be initialized")
@@ -238,12 +266,26 @@ impl Queue {
             if let Some(listener) = &self.unix_listener {
                 reject_new_connections(listener);
             }
-            consume_message(stream)
+            match consume_message(stream) {
+                Ok(val) => val,
+                Err(ref e)
+                    if e.kind() == ErrorKind::BrokenPipe
+                        || e.kind() == ErrorKind::ConnectionReset
+                        || e.kind() == ErrorKind::NotConnected
+                        || e.kind() == ErrorKind::UnexpectedEof =>
+                {
+                    // Peer disconnected — drop stale stream for reconnection.
+                    self.unix_stream = None;
+                    0
+                }
+                Err(_) => {
+                    self.unix_stream = None;
+                    0
+                }
+            }
         } else {
             // If the listener is already initialized then used it
             if let Some(listener) = &self.unix_listener {
-                //self.unix_stream = Some(accept_connection(listener));
-                // self.notify_clear()
                 match accept_connection(listener) {
                     Some(stream) => {
                         self.unix_stream = Some(stream);
@@ -260,14 +302,24 @@ impl Queue {
     }
 }
 
-fn send_message(stream: &mut UnixStream, val: u32) {
-    stream.write(&val.to_be_bytes()).unwrap();
+/// Send a notification value over the socket.
+/// Returns Ok(()) on success, or the io::Error on failure.
+fn send_message(stream: &mut UnixStream, val: u32) -> io::Result<()> {
+    stream.write_all(&val.to_be_bytes())
 }
 
-fn consume_message(stream: &mut UnixStream) -> u32 {
-    let mut buf = [0; 4];
-    let _ = stream.read(&mut buf);
-    u32::from_be_bytes(buf.try_into().expect("cannot convert to to array"))
+/// Read a notification value from the socket. Returns:
+/// - Ok(val) on success (including 0 for WouldBlock/partial reads)
+/// - Err(e) on I/O failure (BrokenPipe, ConnectionReset, EOF, etc.)
+fn consume_message(stream: &mut UnixStream) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    match stream.read(&mut buf) {
+        Ok(0) => Err(io::Error::new(ErrorKind::UnexpectedEof, "peer closed")),
+        Ok(4) => Ok(u32::from_be_bytes(buf)),
+        Ok(_) => Ok(0), // partial read — treat as no-op
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+        Err(e) => Err(e),
+    }
 }
 
 enum SocketInitiable {
@@ -349,7 +401,7 @@ unsafe fn any_as_u8_slice_mut<T: Sized>(p: &mut T) -> &mut [u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::Queue;
+    use super::{Queue, SHAREDQ_EPIPE};
     use rand::random;
     use std::path::Path;
     use std::thread;
@@ -371,7 +423,7 @@ mod tests {
 
         assert_eq!(true, qproducer.is_empty());
         let bytes_written = qproducer.push_non_blocking(&val);
-        assert_eq!(SIZE as u32, bytes_written);
+        assert_eq!(SIZE as i32, bytes_written);
         assert_eq!(false, qproducer.is_empty());
 
         // Read the values from the queue
@@ -410,7 +462,7 @@ mod tests {
 
         for _index in 0..MAX_ELEMS {
             let bytes_written = qproducer.push_non_blocking(&val);
-            assert_eq!(SIZE as u32, bytes_written);
+            assert_eq!(SIZE as i32, bytes_written);
         }
 
         assert_eq!(true, qproducer.is_full());
@@ -436,7 +488,7 @@ mod tests {
         for index in 1..(MAX_ELEMS + 1) {
             val[0] = (index) as u8;
             let bytes_written = qproducer.push_non_blocking(&val);
-            assert_eq!(SIZE as u32, bytes_written);
+            assert_eq!(SIZE as i32, bytes_written);
         }
         let bytes_written = qproducer.push_non_blocking(&val);
         assert_eq!(0, bytes_written);
@@ -476,7 +528,7 @@ mod tests {
                 loop {
                     let written = qproducer.push_non_blocking(&values[i]);
                     if written > 0 {
-                        assert_eq!(MAX_ELEM_SIZE as u32, written);
+                        assert_eq!(MAX_ELEM_SIZE as i32, written);
                         break;
                     }
                 }
@@ -579,5 +631,35 @@ mod tests {
         // Reading when a message was not sent returns 0
         let received = qconsumer.notify_clear();
         assert_eq!(0, received);
+    }
+
+    #[test]
+    fn test_push_returns_epipe_on_dead_consumer() {
+        // Confirms that push_non_blocking() returns SHAREDQ_EPIPE (-32) when
+        // the notification peer closes its socket (BrokenPipe).
+        const MAX_ELEMS: usize = 8;
+        const MAX_ELEM_SIZE: usize = 4;
+        let path = Path::new("/tmp/qtest_epipe");
+
+        let _ = std::fs::remove_file(path.join("notifsocket"));
+
+        let val: [u8; MAX_ELEM_SIZE] = [1, 2, 3, 4];
+
+        let mut qproducer = Queue::new(path, MAX_ELEMS, MAX_ELEM_SIZE).unwrap();
+
+        {
+            let _qconsumer = Queue::new(path, MAX_ELEMS, MAX_ELEM_SIZE).unwrap();
+            qproducer.reset();
+
+            // First push succeeds: producer accepts the connection and sends.
+            let written = qproducer.push_non_blocking(&val);
+            assert_eq!(MAX_ELEM_SIZE as i32, written);
+
+            // _qconsumer drops here, closing its end of the socket.
+        }
+
+        // Second push hits BrokenPipe on notify() and must return SHAREDQ_EPIPE.
+        let rc = qproducer.push_non_blocking(&val);
+        assert_eq!(SHAREDQ_EPIPE, rc);
     }
 }

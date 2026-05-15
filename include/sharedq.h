@@ -46,13 +46,19 @@ typedef struct _queue Queue;
 Queue* create_queue(const char*, uint32_t, uint32_t);
 
 /**
+ * Error code: notification peer disconnected (POSIX EPIPE).
+ * Returned by push() when the socket peer closes unexpectedly.
+ */
+#define SHAREDQ_EPIPE (-32)
+
+/**
  * Pushes a value into the queue in a non-blocking manner.
  * @param queue Pointer to the Queue.
  * @param val Pointer to the data to push.
  * @param size Size of the data in bytes.
- * @return Number of bytes written, or 0 if the queue is full or on error.
+ * @return Positive: bytes written. 0: queue full. SHAREDQ_EPIPE: peer disconnected.
  */
-uint32_t push(Queue*, const char*, uint);
+int32_t push(Queue*, const char*, uint);
 
 /**
  * Resets the queue, clearing all elements.
