@@ -47,7 +47,8 @@ Queue* create_queue(const char*, uint32_t, uint32_t);
 
 /**
  * Error code: notification peer disconnected (POSIX EPIPE).
- * Returned by push() when the socket peer closes unexpectedly.
+ * Returned by push() when the socket peer closes unexpectedly, but data was
+ * enqueued successfully.
  */
 #define SHAREDQ_EPIPE (-32)
 
@@ -94,7 +95,7 @@ int32_t pre_pop(Queue*);
  * @param size Size of the buffer (must match element size).
  * @return Number of bytes read, or -1 on error.
  */
-int32_t pop(Queue*, char*, int32_t);
+int32_t pop(Queue*, char*, uint);
 
 /**
  * Gets the socket file name used for notifications.
