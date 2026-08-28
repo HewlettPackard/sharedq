@@ -95,7 +95,7 @@ impl Queue {
     /// - SHAREDQ_EPIPE (-32): notification peer disconnected (BrokenPipe)
     pub fn push_non_blocking(&mut self, val: &[u8]) -> i32 {
         if val.len() > self.max_elem_size {
-            println!("Unable to save element because is bigger than max element size configured!");
+            eprintln!("Unable to save element because is bigger than max element size configured!");
             return 0;
         }
         if self.is_full() {
@@ -221,7 +221,8 @@ impl Queue {
 
     /// Notify the peer of a new value via the Unix socket.
     ///
-    /// Returns 0 on success, SHAREDQ_EPIPE (-32) if the peer disconnected.
+    /// Returns 0 on success, SHAREDQ_EPIPE (-32) if the peer disconnected,
+    /// or -1 upon listener error
     fn notify(&mut self, val: u32) -> i32 {
         // If the socket stream is already initialized then use it
         if let Some(stream) = &mut self.unix_stream {
@@ -255,7 +256,7 @@ impl Queue {
                     None => 0, // can't notify because the other end is not connected
                 }
             } else {
-                panic!("at least the listener must be initialized")
+                -1
             }
         }
     }
@@ -296,7 +297,7 @@ impl Queue {
                     None => 0, // can't notify because the other end is not connected
                 }
             } else {
-                panic!("at least the listener must be initialized")
+                0   // Listener error
             }
         }
     }
@@ -359,16 +360,39 @@ fn attach_socket(path: &Path) -> Result<SocketInitiable, Error> {
 fn accept_connection(listener: &UnixListener) -> Option<UnixStream> {
     listener.set_nonblocking(true).unwrap();
 
-    match listener.accept() {
-        Ok((stream, _addr)) => {
-            stream.set_nonblocking(true).unwrap();
-            Some(stream)
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                stream.set_nonblocking(true).unwrap();
+
+                // Test the stream for aliveness (either ::WouldBlock or data)
+                match consume_message(&mut stream) {
+                    Ok(_) => return Some(stream),
+                    Err(ref e)
+                        if e.kind() == ErrorKind::BrokenPipe
+                            || e.kind() == ErrorKind::ConnectionReset
+                            || e.kind() == ErrorKind::NotConnected
+                            || e.kind() == ErrorKind::UnexpectedEof => {
+                        // This stream isn't alive. Close and try again.
+                        eprintln!("Will not accept dead stream");
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                    Err(_) => {
+                        // Decline to panic
+                        break;
+                    }
+                }
+            }
+            Err(err) => match err.kind() {
+                io::ErrorKind::WouldBlock => {
+                    // No incoming connections right now
+                    break;
+                }
+                _ => panic!("unexpected error"),
+            }
         }
-        Err(err) => match err.kind() {
-            io::ErrorKind::WouldBlock => None,
-            _ => panic!("unexpected error"),
-        },
     }
+    None
 }
 
 fn reject_new_connections(listener: &UnixListener) {

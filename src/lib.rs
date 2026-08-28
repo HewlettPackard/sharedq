@@ -18,6 +18,7 @@
 // ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 // OTHER DEALINGS IN THE SOFTWARE.
 
+use std::cmp;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uchar, c_uint};
 use std::path::Path;
@@ -148,26 +149,31 @@ pub extern "C" fn pre_pop(q: &mut Queue) -> i32 {
     q.queue.next_elem_size()
 }
 
-/// Pops the next element from the queue into the provided buffer.
+/// Pops the next element from the queue into the provided buffer, truncated
+/// as needed.
 ///
 /// # Arguments
 /// * `q` - Pointer to the Queue.
 /// * `out` - Pointer to the buffer to write the data.
-/// * `size` - Size of the buffer (must match element size).
+/// * `size` - Size of the buffer
 ///
 /// # Returns
 /// Number of bytes read, or -1 on error.
 #[no_mangle]
-pub extern "C" fn pop(q: &mut Queue, out: *mut c_uchar, size: c_int) -> i32 {
-    let expected_size = q.queue.next_elem_size();
-    if size != expected_size {
+pub extern "C" fn pop(q: &mut Queue, out: *mut c_uchar, size: c_uint) -> i32 {
+    if size == 0 {
         return -1;
     }
 
     let elem = q.queue.pop_non_blocking();
-    let out_s = unsafe { slice::from_raw_parts_mut(out, size as usize) };
-    out_s.copy_from_slice(&elem);
-    expected_size
+    if elem.len() == 0 {
+        return -1;
+    }
+    let limit = cmp::min(elem.len(), size as usize);
+
+    let out_s = unsafe { slice::from_raw_parts_mut(out, limit as usize) };
+    out_s.copy_from_slice(&elem[..limit]);
+    limit as i32
 }
 
 /// Gets the socket file name used for notifications.
